@@ -5,7 +5,27 @@ from typing import Optional, List, Dict, Any
 import uvicorn
 import logging
 import traceback
+import sys
+from pathlib import Path
 from utils.git_utils import git_clone, analyze_repository_files
+
+# Add AI engine to path
+current_dir = Path(__file__).parent
+ai_engine_path = current_dir / "ai engine"
+sys.path.append(str(ai_engine_path))
+
+# Try to import AI components
+try:
+    from compliance_analyzer import ComplianceAnalyzer
+    # Initialize a lightweight analyzer for demonstration
+    _global_analyzer = None
+    AI_ENABLED = True
+    print("✓ AI Engine available")
+except ImportError as e:
+    AI_ENABLED = False
+    _global_analyzer = None
+    print(f"⚠ AI Engine not available: {e}")
+    print("  Falling back to basic analysis")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +41,10 @@ app = FastAPI(
 # Add CORS middleware for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=[
+        "https://devsecops-compliance-auditor.vercel.app",
+        "http://localhost:3000",
+    ],  # Whitelist frontend origins (add more as needed)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,6 +55,7 @@ class GitRepoRequest(BaseModel):
     git_repo_url: str
     branch: Optional[str] = "main"
     analysis_depth: Optional[str] = "basic"  # basic, detailed, full
+    use_ai: Optional[bool] = True  # Enable AI-powered analysis
 
 class ComplianceIssue(BaseModel):
     file: str
@@ -39,6 +63,7 @@ class ComplianceIssue(BaseModel):
     severity: str
     line: Optional[int] = None
     description: Optional[str] = None
+    ai_confidence: Optional[float] = None  # AI confidence score
 
 class ScanResponse(BaseModel):
     status: str
@@ -52,6 +77,8 @@ class ScanResponse(BaseModel):
     issues_count: Optional[int] = None
     scan_duration: Optional[float] = None
     error_details: Optional[str] = None
+    ai_enabled: Optional[bool] = None  # Whether AI analysis was used
+    analysis_summary: Optional[Dict[str, Any]] = None  # AI-generated summary
 
 # Root endpoint
 @app.get("/")
@@ -59,9 +86,11 @@ def read_root():
     return {
         "message": "Compliance Auditor API",
         "version": "1.0.0",
+        "ai_enabled": AI_ENABLED,
         "endpoints": {
             "/git-scan": "GET - Scan a Git repository by URL",
             "/git-scan-detailed": "POST - Detailed repository scan with options",
+            "/ai-scan": "POST - AI-powered repository analysis",
             "/health": "GET - Health check",
             "/docs": "GET - API documentation"
         }
@@ -73,8 +102,141 @@ def health_check():
     return {
         "status": "healthy",
         "service": "compliance-auditor-backend",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "ai_enabled": AI_ENABLED,
+        "ai_components": {
+            "legal_bert": AI_ENABLED,
+            "spacy": AI_ENABLED,
+            "policy_processor": AI_ENABLED,
+            "repository_scanner": AI_ENABLED
+        }
     }
+
+def get_analyzer():
+    """Get or create a lightweight analyzer instance"""
+    global _global_analyzer
+    if _global_analyzer is None and AI_ENABLED:
+        try:
+            # Initialize with lightweight settings
+            _global_analyzer = ComplianceAnalyzer(
+                use_legal_bert=False,  # Disable heavy models for demo
+                use_spacy=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize AI analyzer: {e}")
+            _global_analyzer = None
+    return _global_analyzer
+
+# AI-powered repository scan endpoint
+@app.post("/ai-scan", response_model=ScanResponse)
+def ai_scan_repository(request: GitRepoRequest):
+    """
+    Perform AI-powered compliance analysis of a Git repository.
+    
+    Args:
+        request: GitRepoRequest containing repository URL and analysis options
+        
+    Returns:
+        ScanResponse: AI-enhanced compliance analysis results
+    """
+    logger.info(f"Received AI scan request for: {request.git_repo_url}")
+    
+    try:
+        import time
+        start_time = time.time()
+        
+        # Validate URL format
+        if not request.git_repo_url.startswith(('http://', 'https://', 'git@')):
+            logger.warning(f"Invalid URL format: {request.git_repo_url}")
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid git URL format. Must start with http://, https://, or git@"
+            )
+        
+        logger.info("Starting repository clone...")
+        # Clone repository
+        result = git_clone(request.git_repo_url)
+        logger.info(f"Clone result status: {result.get('status', 'unknown')}")
+        
+        if result["status"] == "error":
+            logger.error(f"Clone failed: {result['message']}")
+            raise HTTPException(status_code=400, detail=result["message"])
+        
+        result["ai_enabled"] = AI_ENABLED
+        
+        # Perform analysis
+        if result["status"] == "success" and "clone_path" in result:
+            logger.info("Starting compliance analysis...")
+            
+            if AI_ENABLED and request.use_ai:
+                try:
+                    # Use AI-powered analysis
+                    logger.info("Using AI-powered analysis...")
+                    analyzer = get_analyzer()
+                    
+                    if analyzer is not None:
+                        # Perform repository scanning
+                        ai_results = analyzer.scan_repository(
+                            result["clone_path"], 
+                            file_extensions=['.py', '.js', '.java', '.cpp', '.c', '.php', '.rb', '.go', '.rs', '.ts', '.jsx', '.tsx']
+                        )
+                        
+                        if ai_results.get("status") == "success":
+                            result["compliance_issues"] = ai_results.get("compliance_issues", [])
+                            result["issues_count"] = len([issue for issue in result["compliance_issues"] if "error" not in issue])
+                            result["analysis_summary"] = ai_results.get("summary", {})
+                            logger.info(f"AI analysis found {result['issues_count']} compliance issues")
+                        else:
+                            logger.warning("AI analysis failed, falling back to basic analysis")
+                            # Fallback to basic analysis
+                            compliance_issues = analyze_repository_files(result["clone_path"], analysis_depth=request.analysis_depth)
+                            result["compliance_issues"] = compliance_issues
+                            result["issues_count"] = len([issue for issue in compliance_issues if "error" not in issue])
+                    else:
+                        logger.warning("AI analyzer not available, falling back to basic analysis")
+                        # Fallback to basic analysis
+                        compliance_issues = analyze_repository_files(result["clone_path"], analysis_depth=request.analysis_depth)
+                        result["compliance_issues"] = compliance_issues
+                        result["issues_count"] = len([issue for issue in compliance_issues if "error" not in issue])
+                        
+                except Exception as ai_error:
+                    logger.error(f"AI analysis failed: {ai_error}")
+                    # Fallback to basic analysis
+                    compliance_issues = analyze_repository_files(result["clone_path"], analysis_depth=request.analysis_depth)
+                    result["compliance_issues"] = compliance_issues
+                    result["issues_count"] = len([issue for issue in compliance_issues if "error" not in issue])
+                    result["error_details"] = f"AI analysis failed, used fallback: {str(ai_error)}"
+            else:
+                # Use basic analysis
+                logger.info("Using basic analysis...")
+                compliance_issues = analyze_repository_files(result["clone_path"], analysis_depth=request.analysis_depth)
+                result["compliance_issues"] = compliance_issues
+                result["issues_count"] = len([issue for issue in compliance_issues if "error" not in issue])
+        
+        # Add scan duration
+        end_time = time.time()
+        result["scan_duration"] = round(end_time - start_time, 2)
+        
+        logger.info("AI scan completed successfully")
+        return ScanResponse(**result)
+        
+    except HTTPException:
+        logger.error("HTTPException raised")
+        raise
+    except Exception as e:
+        error_msg = f"Internal server error: {str(e)}"
+        error_traceback = traceback.format_exc()
+        logger.error(f"Unexpected error: {error_msg}")
+        logger.error(f"Traceback: {error_traceback}")
+        
+        # Return detailed error for debugging
+        return {
+            "status": "error",
+            "message": error_msg,
+            "error_details": error_traceback,
+            "repo": request.git_repo_url,
+            "ai_enabled": AI_ENABLED
+        }
 
 # Simple git scan endpoint (GET with query parameter)
 @app.get("/git-scan", response_model=ScanResponse)
@@ -112,7 +274,8 @@ def scan_git_repo(git_repo_url: str):
         if result["status"] == "success" and "clone_path" in result:
             logger.info("Starting compliance analysis...")
             try:
-                compliance_issues = analyze_repository_files(result["clone_path"])
+                # Use basic analysis for simple scan endpoint
+                compliance_issues = analyze_repository_files(result["clone_path"], analysis_depth="basic")
                 result["compliance_issues"] = compliance_issues
                 result["issues_count"] = len([issue for issue in compliance_issues if "error" not in issue])
                 logger.info(f"Found {result['issues_count']} compliance issues")
@@ -261,7 +424,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
-        port=8000, 
+        port=8001,  # Changed to port 8001
         reload=True,
         log_level="info"
     )
