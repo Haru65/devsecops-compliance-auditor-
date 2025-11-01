@@ -23,16 +23,17 @@ RUN apt-get update \
 RUN python -m pip install --upgrade pip setuptools wheel
 
 # Copy only requirements first to leverage Docker cache
-COPY requirements.txt /app/requirements.txt
-COPY backend/requirements.txt /app/backend-requirements.txt
 
-# Install Python dependencies (uses top-level requirements.txt which points to backend/requirements.txt)
+# Copy only requirements first to leverage Docker layer caching
+COPY requirements.txt /app/requirements.txt
+
+# Install Python dependencies from the backend requirements file
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy backend source
-COPY backend /app/backend
+# Copy backend source into the image
+COPY . /app
 
-WORKDIR /app/backend
+WORKDIR /app
 
 # Expose port used by uvicorn
 EXPOSE 8001
